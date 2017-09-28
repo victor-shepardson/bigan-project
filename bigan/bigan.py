@@ -67,7 +67,7 @@ def _take_batches(X, n_batches):
 
                 
 class BiGAN(nn.Module):
-    def __init__(self, E, G, D, latent_dim):
+    def __init__(self, E, G, D, latent_dim, x_cycle_weight=0, z_cycle_weight=0):
         """
         E: nn.Module mapping X to Z
         G: nn.Module mapping Z to X
@@ -79,6 +79,8 @@ class BiGAN(nn.Module):
         self.G = G
         self.D = D
         self.latent_dim = latent_dim
+        self.x_cycle_weight = x_cycle_weight
+        self.z_cycle_weight = z_cycle_weight
 
     def is_cuda(self):
         return any(p.is_cuda for p in self.parameters())
@@ -98,31 +100,39 @@ class BiGAN(nn.Module):
         """Sample self.latent_dim-dimensional unit normal.
         n: batch size
         """
-        return self._wrap(torch.randn(n, self.latent_dim))
+#         return self._wrap(torch.randn(n, self.latent_dim))
 #         return self._wrap(torch.rand(n, self.latent_dim)*2-1)
+        z = torch.randn(n, self.latent_dim)
+        z = z/(z*z).sum(1).sqrt().unsqueeze(1)
+        return self._wrap(z)
 
     def objective(self, x):
         """Objective to minimize for D, E/G"""
-
-        z = self.sample_prior(len(x))
         
-        xs = torch.cat((x, self.G(z)))
-        zs = torch.cat((self.E(x), z))
+        z = self.sample_prior(len(x))
+        x_gen = self.G(z)
+        z_enc = self.E(x)
+        xs = torch.cat((x, x_gen))
+        zs = torch.cat((z_enc, z))
         d_real, d_fake = self.D(xs, zs).chunk(2)
         
+        cycle_loss = 0
+        if self.x_cycle_weight > 0:
+            x_hat = self.G(z_enc)
+            cycle_loss += self.x_cycle_weight * (x-x_hat).abs().mean()
+        if self.z_cycle_weight > 0:
+            z_hat = self.E(x_gen)
+            cycle_loss += self.z_cycle_weight * (z-z_hat).abs().mean()
+            
         return {
-            'EG_loss':
+            'EG_loss': 
+                cycle_loss
                 - (1 - d_real + _eps).log().mean()
                 - (d_fake + _eps).log().mean(),
             'D_loss':
                 - (1 - d_fake + _eps).log().mean()
                 - (d_real + _eps).log().mean()
         }
-        
-#         return (
-#             - (1 - self.D(x, self.E(x)) + _eps).log().mean()
-#             - (self.D(self.G(z), z) + _eps).log().mean()
-#         )
     
     def _epoch(self, X, D_opt=None, EG_opt=None, n_batches=None):
         """Evaluate/optimize for one epoch.
@@ -227,3 +237,77 @@ class BiGAN(nn.Module):
             return x_rec
         # default, 'sample': return code and reconstruction
         return z, x_rec
+    
+class BiLSGAN(BiGAN):
+    def objective(self, x):
+        """Objective to minimize for D, E/G"""
+
+        z = self.sample_prior(len(x))
+        
+        xs = torch.cat((x, self.G(z)))
+        zs = torch.cat((self.E(x), z))
+        ds = self.D(xs, zs)
+        d_real, d_fake = ds.chunk(2)
+        
+        return {
+            'EG_loss':
+                (ds*ds).mean(),
+            'D_loss':
+                ((d_real-1)**2 + (d_fake+1)**2).mean()
+        }
+#         return {
+#             'EG_loss':
+#                 ((d_fake-1)*(d_fake-1) + d_real*d_real).mean(),
+#             'D_loss':
+#                 ((d_real-1)*(d_real-1) + d_fake*d_fake).mean()
+#         }
+
+class BiWGAN(BiGAN):
+    def objective(self, x):
+        """Objective to minimize for D, E/G"""
+        z = self.sample_prior(len(x))
+        z_enc = self.E(x)
+        x_gen = self.G(z)
+        
+        xs = torch.cat((x, x_gen))
+        zs = torch.cat((z_enc, z))
+        ds = self.D(xs, zs)
+        d_real, d_fake = ds.chunk(2)
+        
+        return {
+            'EG_loss':
+                (d_real-d_fake).mean(),
+            'D_loss':
+                (d_fake-d_real).mean() + self.gradient_penalty(x, x_gen, z, z_enc)
+        }
+    
+    def gradient_penalty(self, x, x_gen, z, z_enc, w=10):
+        """WGAN-GP gradient penalty"""
+        assert x.size()==x_gen.size(), 'real and sampled x sizes do not match'
+        assert z.size()==z_enc.size(), 'encoded and sampled z sizes do not match'
+        assert len(x)==len(z), 'x and z batch sizes do not match'
+        batch_size = len(x)
+        alpha_t = torch.cuda.FloatTensor if x.is_cuda else torch.Tensor
+        alpha = alpha_t(batch_size).uniform_()
+        z_hat = z_enc.data*alpha + z.data*(1-alpha)
+        z_hat = Variable(z_hat, requires_grad=True)
+        alpha = alpha.view(batch_size, 1, 1, 1)
+        x_hat = x.data*alpha + x_gen.data*(1-alpha)
+        x_hat = Variable(x_hat, requires_grad=True)
+
+        def eps_norm(x):
+            return (x*x+_eps).sum(-1).sqrt()
+        def bi_penalty(x):
+            return (x-1)**2
+
+        d = self.D(x_hat, z_hat).sum()
+        grad_xhat = torch.autograd.grad(
+            d, x_hat, create_graph=True, only_inputs=True
+        )[0]
+        grad_zhat = torch.autograd.grad(
+            d, z_hat, create_graph=True, only_inputs=True
+        )[0]
+    
+        grads = torch.cat((grad_xhat.flatten(), grad_zhat.flatten()))
+        penalty = w*bi_penalty(eps_norm(grads)).mean()
+        return penalty
